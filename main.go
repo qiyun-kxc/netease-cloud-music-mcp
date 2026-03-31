@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -25,6 +26,18 @@ const (
 )
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+// toInt 兼容 MCP 传来的 number（float64）和 string 两种类型
+func toInt(v interface{}) (int, error) {
+	switch val := v.(type) {
+	case float64:
+		return int(val), nil
+	case string:
+		return strconv.Atoi(val)
+	default:
+		return 0, fmt.Errorf("unsupported type for numeric field: %T", v)
+	}
+}
 
 // apiGet 发起 GET 请求
 func apiGet(path string) ([]byte, error) {
@@ -354,7 +367,7 @@ func getPlaylistDetail(playlistID int) (string, error) {
 
 	sb.WriteString("\n")
 
-	// 歌曲列表（trackIds 里只有 id，需要用 tracks 如果有的话）
+	// 歌曲列表
 	if tracks, ok := playlist["tracks"].([]interface{}); ok && len(tracks) > 0 {
 		sb.WriteString("📋 歌曲列表:\n\n")
 		maxShow := 50
@@ -442,7 +455,6 @@ func searchPlaylist(keyword string, limit int) (string, error) {
 
 		desc := ""
 		if d, ok := pl["description"].(string); ok && d != "" {
-			// 截取前80个字符
 			r := []rune(d)
 			if len(r) > 80 {
 				desc = string(r[:80]) + "..."
@@ -458,6 +470,154 @@ func searchPlaylist(keyword string, limit int) (string, error) {
 		}
 		sb.WriteString(fmt.Sprintf("   ID: %.0f | 链接: https://music.163.com/playlist?id=%.0f\n\n", id, id))
 	}
+	return sb.String(), nil
+}
+
+// ============================================================
+// 随机推荐（从公开榜单里随机抽歌）
+// ============================================================
+
+func getRandomRecommend(count int) (string, error) {
+	// 不需要登录的公开榜单
+	type chart struct {
+		id   int
+		name string
+	}
+	charts := []chart{
+		{3778678, "热歌榜"},
+		{3779629, "新歌榜"},
+		{2884035, "原创榜"},
+		{19723756, "飙升榜"},
+		{5059644681, "古典音乐榜"},
+		{71384707, "华语金曲榜"},
+		{10520166, "网络热歌榜"},
+		{2250011882, "后摇榜"},
+		{745956260, "ACG音乐榜"},
+		{2023401535, "民谣榜"},
+	}
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	chosen := charts[rng.Intn(len(charts))]
+
+	path := fmt.Sprintf("/api/v6/playlist/detail?id=%d", chosen.id)
+	data, err := apiGet(path)
+	if err != nil {
+		return "", fmt.Errorf("获取榜单失败: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", err
+	}
+
+	playlist, ok := result["playlist"].(map[string]interface{})
+	if !ok {
+		return "未能获取推荐", nil
+	}
+
+	tracks, ok := playlist["tracks"].([]interface{})
+	if !ok || len(tracks) == 0 {
+		return "榜单里没有歌", nil
+	}
+
+	// 随机抽 count 首
+	if count > len(tracks) {
+		count = len(tracks)
+	}
+	perm := rng.Perm(len(tracks))
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🎲 今日随机推荐（来自「%s」）\n", chosen.name))
+	sb.WriteString(strings.Repeat("─", 40) + "\n\n")
+
+	for i := 0; i < count; i++ {
+		track := tracks[perm[i]].(map[string]interface{})
+		trackName := track["name"].(string)
+		trackID := track["id"].(float64)
+
+		artistNames := make([]string, 0)
+		if ar, ok := track["ar"].([]interface{}); ok {
+			for _, a := range ar {
+				if artist, ok := a.(map[string]interface{}); ok {
+					if n, ok := artist["name"].(string); ok {
+						artistNames = append(artistNames, n)
+					}
+				}
+			}
+		}
+
+		albumName := ""
+		if al, ok := track["al"].(map[string]interface{}); ok {
+			if n, ok := al["name"].(string); ok {
+				albumName = n
+			}
+		}
+
+		duration := ""
+		if d, ok := track["dt"].(float64); ok {
+			mins := int(d) / 1000 / 60
+			secs := (int(d) / 1000) % 60
+			duration = fmt.Sprintf("%d:%02d", mins, secs)
+		}
+
+		sb.WriteString(fmt.Sprintf("%d. %s - %s\n", i+1, trackName, strings.Join(artistNames, "/")))
+		sb.WriteString(fmt.Sprintf("   专辑: %s | 时长: %s | ID: %.0f\n", albumName, duration, trackID))
+		sb.WriteString(fmt.Sprintf("   链接: https://music.163.com/song?id=%.0f\n\n", trackID))
+	}
+	return sb.String(), nil
+}
+
+// ============================================================
+// 获取音频链接
+// ============================================================
+
+func getSongURL(songID int) (string, error) {
+	path := fmt.Sprintf("/api/song/enhance/player/url?ids=[%d]&br=320000", songID)
+	data, err := apiGet(path)
+	if err != nil {
+		return "", err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", err
+	}
+
+	dataArr, ok := result["data"].([]interface{})
+	if !ok || len(dataArr) == 0 {
+		return "未能获取音频信息", nil
+	}
+
+	song := dataArr[0].(map[string]interface{})
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🎵 歌曲 ID: %d\n", songID))
+	sb.WriteString(strings.Repeat("─", 40) + "\n")
+
+	// 音频链接
+	if u, ok := song["url"].(string); ok && u != "" {
+		sb.WriteString(fmt.Sprintf("🔗 音频链接: %s\n", u))
+	} else {
+		sb.WriteString("🔗 音频链接: 暂无（可能因版权限制）\n")
+	}
+
+	// 码率
+	if br, ok := song["br"].(float64); ok && br > 0 {
+		sb.WriteString(fmt.Sprintf("📊 码率: %.0f kbps\n", br/1000))
+	}
+
+	// 大小
+	if size, ok := song["size"].(float64); ok && size > 0 {
+		sb.WriteString(fmt.Sprintf("📦 大小: %.1f MB\n", size/1024/1024))
+	}
+
+	// 格式
+	if t, ok := song["type"].(string); ok && t != "" {
+		sb.WriteString(fmt.Sprintf("🎧 格式: %s\n", t))
+	}
+
+	sb.WriteString(fmt.Sprintf("\n💡 在线播放: https://music.163.com/song?id=%d\n", songID))
+
 	return sb.String(), nil
 }
 
@@ -484,7 +644,10 @@ func searchArtistHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 }
 
 func getLyricsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	songID := int(request.Params.Arguments["song_id"].(float64))
+	songID, err := toInt(request.Params.Arguments["song_id"])
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("参数错误: %v", err)), nil
+	}
 	result, err := getSongLyrics(songID)
 	if err != nil {
 		return mcp.NewToolResultText(fmt.Sprintf("获取歌词失败: %v", err)), nil
@@ -493,10 +656,15 @@ func getLyricsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 }
 
 func getCommentsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	songID := int(request.Params.Arguments["song_id"].(float64))
+	songID, err := toInt(request.Params.Arguments["song_id"])
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("参数错误: %v", err)), nil
+	}
 	limit := 15
-	if l, ok := request.Params.Arguments["limit"].(float64); ok {
-		limit = int(l)
+	if l, ok := request.Params.Arguments["limit"]; ok {
+		if lInt, err2 := toInt(l); err2 == nil {
+			limit = lInt
+		}
 	}
 	result, err := getSongComments(songID, limit)
 	if err != nil {
@@ -506,7 +674,10 @@ func getCommentsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.
 }
 
 func getPlaylistHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	playlistID := int(request.Params.Arguments["playlist_id"].(float64))
+	playlistID, err := toInt(request.Params.Arguments["playlist_id"])
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("参数错误: %v", err)), nil
+	}
 	result, err := getPlaylistDetail(playlistID)
 	if err != nil {
 		return mcp.NewToolResultText(fmt.Sprintf("获取歌单失败: %v", err)), nil
@@ -519,6 +690,32 @@ func searchPlaylistHandler(ctx context.Context, request mcp.CallToolRequest) (*m
 	result, err := searchPlaylist(keyword, 15)
 	if err != nil {
 		return mcp.NewToolResultText(fmt.Sprintf("搜索失败: %v", err)), nil
+	}
+	return mcp.NewToolResultText(result), nil
+}
+
+func randomRecommendHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	count := 5
+	if c, ok := request.Params.Arguments["count"]; ok {
+		if cInt, err := toInt(c); err == nil && cInt > 0 {
+			count = cInt
+		}
+	}
+	result, err := getRandomRecommend(count)
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("推荐失败: %v", err)), nil
+	}
+	return mcp.NewToolResultText(result), nil
+}
+
+func getSongURLHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	songID, err := toInt(request.Params.Arguments["song_id"])
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("参数错误: %v", err)), nil
+	}
+	result, err := getSongURL(songID)
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("获取链接失败: %v", err)), nil
 	}
 	return mcp.NewToolResultText(result), nil
 }
@@ -588,6 +785,24 @@ func main() {
 			mcp.WithString("keyword", mcp.Required(), mcp.Description("搜索关键词，如心情、场景、风格")),
 		),
 		searchPlaylistHandler,
+	)
+
+	// 注册工具：随机推荐
+	s.AddTool(
+		mcp.NewTool("random_recommend",
+			mcp.WithDescription("从网易云音乐公开榜单（热歌榜、新歌榜、原创榜、民谣榜、ACG榜等）随机抽几首歌推荐，适合想听点新东西但不知道听什么的时候"),
+			mcp.WithNumber("count", mcp.Description("推荐歌曲数量，默认5首")),
+		),
+		randomRecommendHandler,
+	)
+
+	// 注册工具：获取音频链接
+	s.AddTool(
+		mcp.NewTool("get_song_url",
+			mcp.WithDescription("获取歌曲的音频播放链接、码率、格式等信息。部分歌曲因版权限制可能无法获取链接"),
+			mcp.WithNumber("song_id", mcp.Required(), mcp.Description("歌曲ID，可通过search_song获取")),
+		),
+		getSongURLHandler,
 	)
 
 	// 以 SSE 模式启动
